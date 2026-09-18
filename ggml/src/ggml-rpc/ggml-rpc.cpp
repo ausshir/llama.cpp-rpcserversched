@@ -1152,6 +1152,7 @@ public:
         scheds.resize(backends.size(), nullptr);
         sched_backends.resize(backends.size());
         sched_sig.assign(backends.size(), 0);
+        sched_size.assign(backends.size(), 0);
 
         // CPU fallback for ops the device backend cannot run (opt-in via GGML_RPC_CPU_FALLBACK)
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1194,7 +1195,7 @@ public:
 
 private:
     // per-device scheduler over {exposed device, server CPU}, created lazily
-    ggml_backend_sched_t get_sched(uint32_t device) {
+    ggml_backend_sched_t get_sched(uint32_t device, size_t graph_size) {
         if (device >= backends.size() || cpu_backend == nullptr) {
             return nullptr;
         }
@@ -1202,13 +1203,25 @@ private:
         if (ggml_backend_dev_type(ggml_backend_get_device(backends[device])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
             return nullptr;
         }
-        if (scheds[device] != nullptr) {
+        // the sched sizes its hash set from graph_size and asserts it covers n_nodes+n_leafs; recreate when too small
+        if (scheds[device] != nullptr && sched_size[device] >= graph_size) {
             return scheds[device];
+        }
+        if (scheds[device] != nullptr) {
+            ggml_backend_sched_free(scheds[device]);
+            scheds[device] = nullptr;
+            sched_sig[device] = 0;  // placement must be re-derived
+        }
+        // headroom so a somewhat larger graph does not immediately recreate the sched again
+        size_t want = graph_size + graph_size / 2;
+        if (want < GGML_DEFAULT_GRAPH_SIZE) {
+            want = GGML_DEFAULT_GRAPH_SIZE;
         }
         std::vector<ggml_backend_t> & list = sched_backends[device];
         list = { backends[device], cpu_backend };  // CPU must be last (asserted in ggml_backend_sched_new)
         scheds[device] = ggml_backend_sched_new(list.data(), nullptr, (int) list.size(),
-                                                GGML_DEFAULT_GRAPH_SIZE, /*parallel*/ false, /*op_offload*/ true);
+                                                want, /*parallel*/ false, /*op_offload*/ true);
+        sched_size[device] = want;
         return scheds[device];
     }
 
@@ -1226,6 +1239,7 @@ private:
     std::vector<ggml_backend_sched_t> scheds;
     std::vector<std::vector<ggml_backend_t>> sched_backends;
     std::vector<uint64_t> sched_sig;
+    std::vector<size_t> sched_size; // graph size each sched was created with
     size_t n_threads = 0;
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
@@ -1811,8 +1825,8 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
         }
     }
-    ggml_backend_sched_t sched = get_sched(device);
-    if (sched) {
+    ggml_backend_sched_t sched = nullptr;
+    if (cpu_backend != nullptr) {
         // the deserialized graph has no leafs, but the scheduler indexes every node and leaf; populate from srcs
         {
             std::unordered_set<ggml_tensor *> node_set;
@@ -1839,6 +1853,8 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             }
         }
         LOG_DBG("[%s] graph: %d nodes, %d leafs (populated)\n", __func__, graph->n_nodes, graph->n_leafs);
+
+        sched = get_sched(device, (size_t) graph->n_nodes + graph->n_leafs);
     }
     if (RPC_DEBUG) {
         // log where the work will go
@@ -1900,7 +1916,7 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     ggml_cgraph * graph = stored_graphs[device].graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
     ggml_status status;
-    if (ggml_backend_sched_t sched = get_sched(device)) {
+    if (ggml_backend_sched_t sched = get_sched(device, (size_t) graph->n_nodes + graph->n_leafs)) {
         status = ggml_backend_sched_graph_compute(sched, graph);
     } else {
         status = ggml_backend_graph_compute(backends[device], graph);
