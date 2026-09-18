@@ -1251,6 +1251,7 @@ private:
     ggml_backend_buffer_type_t staging_buft = nullptr;
     std::vector<ggml_backend_sched_t> scheds;
     std::vector<std::vector<ggml_backend_t>> sched_backends;
+    // one placement slot per device; alternating graphs evict each other
     std::vector<uint64_t> sched_sig;
     std::vector<size_t> sched_size; // graph size each sched was created with
     std::unordered_set<ggml_backend_buffer_t> buffers;
@@ -1935,7 +1936,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             sig_mix(&t.use_count, sizeof(t.use_count));
         }
         if (sched_sig[device] != sig) {
-            LOG_DBG("[%s] graph changed (device %u, sig %016" PRIx64 ") - re-deriving placement\n",
+            LOG_DBG("[%s] graph changed, resetting placement (device %u, sig %016" PRIx64 ")\n",
                     __func__, device, sig);
             ggml_backend_sched_reset(sched);
             sched_sig[device] = sig;
