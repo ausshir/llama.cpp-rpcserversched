@@ -1856,10 +1856,6 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
         graph->use_counts[hash_pos] = rpc_node->use_count;
-        if (rpc_node->use_count == 0 && graph->nodes[i]->op != GGML_OP_NONE &&
-            !is_cpu_accessible(graph->nodes[i]) && graph->nodes[i]->buffer != nullptr && graph->nodes[i]->data != nullptr) {
-            stored.outputs.push_back({graph->nodes[i], graph->nodes[i]->buffer, graph->nodes[i]->data});
-        }
     }
     ggml_backend_sched_t sched = nullptr;
     if (cpu_backend != nullptr) {
@@ -1892,12 +1888,10 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
 
         sched = get_sched(device, (size_t) graph->n_nodes + graph->n_leafs);
         if (sched != nullptr) {
-            // let the sched own node outputs; leafs stay bound to client buffers
+            // move only fallback nodes to sched buffers; supported nodes stay in client buffers
+            std::unordered_set<ggml_tensor *> moved;
             for (int i = 0; i < graph->n_nodes; i++) {
                 ggml_tensor * node = graph->nodes[i];
-                if (node == nullptr) {
-                    continue;
-                }
                 const bool device_supports = ggml_backend_supports_op(backends[device], node);
                 const bool cpu_accessible = is_cpu_accessible(node);
                 if (!device_supports && node->view_src != nullptr && !cpu_accessible) {
@@ -1908,8 +1902,21 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
                     GGML_LOG_ERROR("[%s] no backend supports op %s\n", __func__, ggml_op_name(node->op));
                     return false;
                 }
-                if (node->op == GGML_OP_NONE || cpu_accessible) {
-                    continue;
+                if (!device_supports && !cpu_accessible) {
+                    moved.insert(node);
+                }
+            }
+            for (int i = 0; i < graph->n_nodes; i++) {
+                ggml_tensor * node = graph->nodes[i];
+                if (node->view_src != nullptr && moved.count(node->view_src) && !is_cpu_accessible(node)) {
+                    moved.insert(node);
+                }
+            }
+            LOG_DBG("[%s] moving %zu/%d nodes to sched buffers\n", __func__, moved.size(), graph->n_nodes);
+            for (ggml_tensor * node : moved) {
+                const size_t hash_pos = ggml_hash_find(&graph->visited_hash_set, node);
+                if (graph->use_counts[hash_pos] == 0 && node->buffer != nullptr && node->data != nullptr) {
+                    stored.outputs.push_back({node, node->buffer, node->data});
                 }
                 node->buffer = nullptr;
                 node->data   = nullptr;
