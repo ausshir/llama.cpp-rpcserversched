@@ -1147,7 +1147,7 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
 class rpc_server {
 public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, size_t n_threads)
-        : backends(std::move(all_backends)), cache_dir(cache_dir), n_threads(n_threads) {
+        : backends(std::move(all_backends)), cache_dir(cache_dir) {
         stored_graphs.resize(backends.size());
         scheds.resize(backends.size(), nullptr);
         sched_backends.resize(backends.size());
@@ -1240,7 +1240,6 @@ private:
     std::vector<std::vector<ggml_backend_t>> sched_backends;
     std::vector<uint64_t> sched_sig;
     std::vector<size_t> sched_size; // graph size each sched was created with
-    size_t n_threads = 0;
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
