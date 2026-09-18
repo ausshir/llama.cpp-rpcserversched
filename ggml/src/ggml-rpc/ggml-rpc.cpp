@@ -1891,6 +1891,11 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             if (!pinned || ggml_backend_supports_op(backends[device], node)) {
                 continue;
             }
+            // if CPU can use the buffer in place (unified memory), leave it pinned
+            ggml_backend_buffer_t buf = node->view_src != nullptr ? node->view_src->buffer : node->buffer;
+            if (buf != nullptr && ggml_backend_supports_buft(cpu_backend, buf->buft)) {
+                continue;
+            }
             // a view must stay in its source's memory; an op the server CPU cannot run has nowhere to go
             if (node->view_src != nullptr || !ggml_backend_supports_op(cpu_backend, node)) {
                 GGML_LOG_ERROR("[%s] cannot stage tensor %s (op %s)\n", __func__, node->name, ggml_op_name(node->op));
