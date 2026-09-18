@@ -24,6 +24,7 @@
 #include <thread>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+static const char * RPC_CPU_FALLBACK = std::getenv("GGML_RPC_CPU_FALLBACK");
 
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
@@ -1152,9 +1153,9 @@ public:
         sched_backends.resize(backends.size());
         sched_sig.assign(backends.size(), 0);
 
-        // CPU fallback for ops the device backend cannot run
+        // CPU fallback for ops the device backend cannot run (opt-in via GGML_RPC_CPU_FALLBACK)
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        if (cpu_dev != nullptr) {
+        if (RPC_CPU_FALLBACK && cpu_dev != nullptr) {
             cpu_backend = ggml_backend_dev_init(cpu_dev, nullptr);
             if (cpu_backend != nullptr && n_threads > 0) {
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(cpu_dev);
@@ -1810,45 +1811,49 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
         }
     }
-    // the deserialized graph has no leafs, but the scheduler indexes every node and leaf; populate from srcs
-    {
-        std::unordered_set<ggml_tensor *> node_set;
-        node_set.reserve((size_t) graph->n_nodes * 2);
-        for (int i = 0; i < graph->n_nodes; i++) {
-            node_set.insert(graph->nodes[i]);
-        }
-        std::unordered_set<ggml_tensor *> leaf_set;
-        leaf_set.reserve((size_t) graph->n_nodes);
-        for (int i = 0; i < graph->n_nodes; i++) {
-            struct ggml_tensor * node = graph->nodes[i];
-            for (int j = 0; j < GGML_MAX_SRC; j++) {
-                struct ggml_tensor * src_tensor = node->src[j];
-                if (src_tensor == nullptr || node_set.count(src_tensor)) {
-                    continue;
-                }
-                if (!leaf_set.insert(src_tensor).second) {
-                    continue;   // already listed as a leaf
-                }
-                if (graph->n_leafs < graph->size) {
-                    graph->leafs[graph->n_leafs++] = src_tensor;
+    ggml_backend_sched_t sched = get_sched(device);
+    if (sched) {
+        // the deserialized graph has no leafs, but the scheduler indexes every node and leaf; populate from srcs
+        {
+            std::unordered_set<ggml_tensor *> node_set;
+            node_set.reserve((size_t) graph->n_nodes * 2);
+            for (int i = 0; i < graph->n_nodes; i++) {
+                node_set.insert(graph->nodes[i]);
+            }
+            std::unordered_set<ggml_tensor *> leaf_set;
+            leaf_set.reserve((size_t) graph->n_nodes);
+            for (int i = 0; i < graph->n_nodes; i++) {
+                struct ggml_tensor * node = graph->nodes[i];
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    struct ggml_tensor * src_tensor = node->src[j];
+                    if (src_tensor == nullptr || node_set.count(src_tensor)) {
+                        continue;
+                    }
+                    if (!leaf_set.insert(src_tensor).second) {
+                        continue;    // already listed as a leaf
+                    }
+                    if (graph->n_leafs < graph->size) {
+                        graph->leafs[graph->n_leafs++] = src_tensor;
+                    }
                 }
             }
         }
+        LOG_DBG("[%s] graph: %d nodes, %d leafs (populated)\n", __func__, graph->n_nodes, graph->n_leafs);
     }
-    LOG_DBG("[%s] graph: %d nodes, %d leafs (populated)\n", __func__, graph->n_nodes, graph->n_leafs);
-
-    // log where the work will go
-    int n_ops_dev = 0;
-    for (int i = 0; i < graph->n_nodes; i++) {
-        if (ggml_backend_supports_op(backends[device], graph->nodes[i])) {
-            n_ops_dev++;
+    if (RPC_DEBUG) {
+        // log where the work will go
+        int n_ops_dev = 0;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            if (ggml_backend_supports_op(backends[device], graph->nodes[i])) {
+                n_ops_dev++;
+            }
         }
+        LOG_DBG("[%s] device %u: %d/%d ops on %s, %d on server CPU\n", __func__, device,
+                n_ops_dev, graph->n_nodes, ggml_backend_name(backends[device]), graph->n_nodes - n_ops_dev);
     }
-    LOG_DBG("[%s] device %u: %d/%d ops on %s, %d on server CPU\n", __func__, device,
-            n_ops_dev, graph->n_nodes, ggml_backend_name(backends[device]), graph->n_nodes - n_ops_dev);
 
     ggml_status status;
-    if (ggml_backend_sched_t sched = get_sched(device)) {
+    if (sched) {
         // re-derive placement only when the graph structure changed; exclude buffer pointers (the client may move them)
         uint64_t sig = 1469598103934665603ull;
         auto sig_mix = [&sig](const void * p, size_t n) {
