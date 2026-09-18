@@ -1145,9 +1145,26 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
 
 class rpc_server {
 public:
-    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
-        : backends(std::move(all_backends)), cache_dir(cache_dir) {
+    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, size_t n_threads)
+        : backends(std::move(all_backends)), cache_dir(cache_dir), n_threads(n_threads) {
         stored_graphs.resize(backends.size());
+        scheds.resize(backends.size(), nullptr);
+        sched_backends.resize(backends.size());
+        sched_sig.assign(backends.size(), 0);
+
+        // CPU fallback for ops the device backend cannot run
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev != nullptr) {
+            cpu_backend = ggml_backend_dev_init(cpu_dev, nullptr);
+            if (cpu_backend != nullptr && n_threads > 0) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(cpu_dev);
+                auto set_n_threads_fn = (ggml_backend_set_n_threads_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+                if (set_n_threads_fn != nullptr) {
+                    set_n_threads_fn(cpu_backend, n_threads);
+                }
+            }
+        }
     }
     ~rpc_server();
 
@@ -1175,6 +1192,25 @@ public:
     };
 
 private:
+    // per-device scheduler over {exposed device, server CPU}, created lazily
+    ggml_backend_sched_t get_sched(uint32_t device) {
+        if (device >= backends.size() || cpu_backend == nullptr) {
+            return nullptr;
+        }
+        // no fallback for a CPU-only endpoint (a {CPU, CPU} sched aborts in ggml_backend_sched_alloc_graph)
+        if (ggml_backend_dev_type(ggml_backend_get_device(backends[device])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return nullptr;
+        }
+        if (scheds[device] != nullptr) {
+            return scheds[device];
+        }
+        std::vector<ggml_backend_t> & list = sched_backends[device];
+        list = { backends[device], cpu_backend };  // CPU must be last (asserted in ggml_backend_sched_new)
+        scheds[device] = ggml_backend_sched_new(list.data(), nullptr, (int) list.size(),
+                                                GGML_DEFAULT_GRAPH_SIZE, /*parallel*/ false, /*op_offload*/ true);
+        return scheds[device];
+    }
+
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
     ggml_tensor * create_node(uint64_t id,
@@ -1185,6 +1221,11 @@ private:
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
+    ggml_backend_t cpu_backend = nullptr;
+    std::vector<ggml_backend_sched_t> scheds;
+    std::vector<std::vector<ggml_backend_t>> sched_backends;
+    std::vector<uint64_t> sched_sig;
+    size_t n_threads = 0;
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
@@ -1769,8 +1810,76 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
         }
     }
-    ggml_status status = ggml_backend_graph_compute(backends[device], graph);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    // the deserialized graph has no leafs, but the scheduler indexes every node and leaf; populate from srcs
+    {
+        std::unordered_set<ggml_tensor *> node_set;
+        node_set.reserve((size_t) graph->n_nodes * 2);
+        for (int i = 0; i < graph->n_nodes; i++) {
+            node_set.insert(graph->nodes[i]);
+        }
+        std::unordered_set<ggml_tensor *> leaf_set;
+        leaf_set.reserve((size_t) graph->n_nodes);
+        for (int i = 0; i < graph->n_nodes; i++) {
+            struct ggml_tensor * node = graph->nodes[i];
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                struct ggml_tensor * src_tensor = node->src[j];
+                if (src_tensor == nullptr || node_set.count(src_tensor)) {
+                    continue;
+                }
+                if (!leaf_set.insert(src_tensor).second) {
+                    continue;   // already listed as a leaf
+                }
+                if (graph->n_leafs < graph->size) {
+                    graph->leafs[graph->n_leafs++] = src_tensor;
+                }
+            }
+        }
+    }
+    LOG_DBG("[%s] graph: %d nodes, %d leafs (populated)\n", __func__, graph->n_nodes, graph->n_leafs);
+
+    // log where the work will go
+    int n_ops_dev = 0;
+    for (int i = 0; i < graph->n_nodes; i++) {
+        if (ggml_backend_supports_op(backends[device], graph->nodes[i])) {
+            n_ops_dev++;
+        }
+    }
+    LOG_DBG("[%s] device %u: %d/%d ops on %s, %d on server CPU\n", __func__, device,
+            n_ops_dev, graph->n_nodes, ggml_backend_name(backends[device]), graph->n_nodes - n_ops_dev);
+
+    ggml_status status;
+    if (ggml_backend_sched_t sched = get_sched(device)) {
+        // re-derive placement only when the graph structure changed; exclude buffer pointers (the client may move them)
+        uint64_t sig = 1469598103934665603ull;
+        auto sig_mix = [&sig](const void * p, size_t n) {
+            const unsigned char * b = (const unsigned char *) p;
+            for (size_t i = 0; i < n; i++) { sig ^= b[i]; sig *= 1099511628211ull; }
+        };
+        sig_mix(&n_nodes, sizeof(n_nodes));
+        sig_mix(nodes, (size_t) n_nodes * sizeof(uint64_t));
+        for (uint32_t i = 0; i < n_tensors; i++) {
+            const rpc_tensor & t = tensors[i];
+            sig_mix(&t.id, sizeof(t.id));
+            sig_mix(&t.op, sizeof(t.op));
+            sig_mix(&t.type, sizeof(t.type));
+            sig_mix(t.ne, sizeof(t.ne));
+            sig_mix(t.src, sizeof(t.src));
+            sig_mix(&t.use_count, sizeof(t.use_count));
+        }
+        if (sched_sig[device] != sig) {
+            LOG_DBG("[%s] graph changed (device %u, sig %016" PRIx64 ") - re-deriving placement\n",
+                    __func__, device, sig);
+            ggml_backend_sched_reset(sched);
+            sched_sig[device] = sig;
+        }
+        status = ggml_backend_sched_graph_compute(sched, graph);
+    } else {
+        status = ggml_backend_graph_compute(backends[device], graph);
+    }
+    if (status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("[%s] graph compute failed (device %u, status %d)\n", __func__, device, status);
+        return false;
+    }
     stored_graphs[device].graph = graph;
     return true;
 }
@@ -1785,8 +1894,16 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     ggml_cgraph * graph = stored_graphs[device].graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
-    ggml_status status = ggml_backend_graph_compute(backends[device], graph);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    ggml_status status;
+    if (ggml_backend_sched_t sched = get_sched(device)) {
+        status = ggml_backend_sched_graph_compute(sched, graph);
+    } else {
+        status = ggml_backend_graph_compute(backends[device], graph);
+    }
+    if (status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("[%s] graph compute failed (device %u, status %d)\n", __func__, device, status);
+        return false;
+    }
     return true;
 }
 
@@ -1805,14 +1922,22 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    for (auto sched : scheds) {
+        if (sched != nullptr) {
+            ggml_backend_sched_free(sched);
+        }
+    }
+    if (cpu_backend != nullptr) {
+        ggml_backend_free(cpu_backend);
+    }
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
 }
 
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
-                             socket_ptr sock) {
-    rpc_server server(backends, cache_dir);
+                             size_t n_threads, socket_ptr sock) {
+    rpc_server server(backends, cache_dir, n_threads);
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
         return;
@@ -2141,7 +2266,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         }
         printf("Accepted client connection\n");
         fflush(stdout);
-        rpc_serve_client(backends, cache_dir, client_socket);
+        rpc_serve_client(backends, cache_dir, n_threads, client_socket);
         printf("Client connection closed\n");
         fflush(stdout);
     }
