@@ -1158,6 +1158,9 @@ public:
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         if (RPC_CPU_FALLBACK && cpu_dev != nullptr) {
             cpu_backend = ggml_backend_dev_init(cpu_dev, nullptr);
+            if (cpu_backend != nullptr) {
+                staging_buft = ggml_backend_get_default_buffer_type(cpu_backend);
+            }
             if (cpu_backend != nullptr && n_threads > 0) {
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(cpu_dev);
                 auto set_n_threads_fn = (ggml_backend_set_n_threads_t)
@@ -1188,12 +1191,12 @@ public:
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
 
-    // CPU staging for an op output pinned in a device buffer that the device cannot run
+    // op output pinned in a device buffer the device cannot run, restaged in a host buffer
     struct reloc_tensor {
         ggml_tensor           * tensor;
-        ggml_backend_buffer_t   buffer;
-        void                  * data;
-        std::vector<uint8_t>    host;
+        ggml_backend_buffer_t   buffer; // client's device buffer
+        void                  * data;   // address inside it
+        ggml_backend_buffer_t   host;   // staging buffer on the server CPU
     };
 
     struct stored_graph {
@@ -1245,6 +1248,7 @@ private:
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
     ggml_backend_t cpu_backend = nullptr;
+    ggml_backend_buffer_type_t staging_buft = nullptr;
     std::vector<ggml_backend_sched_t> scheds;
     std::vector<std::vector<ggml_backend_t>> sched_backends;
     std::vector<uint64_t> sched_sig;
@@ -1881,6 +1885,9 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         // pinned op outputs the device cannot run abort in ggml_backend_sched_split_graph
         // stage them on the server CPU, copy back into the client buffer after compute
         auto & reloc = stored_graphs[device].relocated;
+        for (auto & r : reloc) {
+            ggml_backend_buffer_free(r.host);
+        }
         reloc.clear();
         for (int i = 0; i < graph->n_nodes; i++) {
             ggml_tensor * node = graph->nodes[i];
@@ -1901,10 +1908,14 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
                 GGML_LOG_ERROR("[%s] cannot stage tensor %s (op %s)\n", __func__, node->name, ggml_op_name(node->op));
                 return false;
             }
-            // with buffer == nullptr and data staged, the sched must place the op on the CPU
-            reloc.push_back({node, node->buffer, node->data, std::vector<uint8_t>(ggml_nbytes(node))});
-            node->buffer = nullptr;
-            node->data   = reloc.back().host.data();
+            // pinned in a host buffer, the sched must place the op on the CPU
+            ggml_backend_buffer_t host = ggml_backend_buft_alloc_buffer(staging_buft, ggml_backend_buft_get_alloc_size(staging_buft, node));
+            if (host == nullptr) {
+                return false;
+            }
+            reloc.push_back({node, node->buffer, node->data, host});
+            node->buffer = host;
+            node->data   = ggml_backend_buffer_get_base(host);
         }
         // re-derive placement only when the graph structure changed; exclude buffer pointers (the client may move them)
         uint64_t sig = 1469598103934665603ull;
@@ -1933,9 +1944,10 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         for (auto & r : reloc) {
             r.tensor->buffer = r.buffer;
             r.tensor->data   = r.data;
-            ggml_backend_tensor_set(r.tensor, r.host.data(), 0, r.host.size());
-            r.tensor->buffer = nullptr;
-            r.tensor->data   = r.host.data();
+            const void * host_data = ggml_backend_buffer_get_base(r.host);
+            ggml_backend_tensor_set(r.tensor, host_data, 0, ggml_nbytes(r.tensor));
+            r.tensor->buffer = r.host;
+            r.tensor->data   = (void *) host_data;
         }
     } else {
         status = ggml_backend_graph_compute(backends[device], graph);
@@ -1964,9 +1976,10 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
         for (auto & r : stored_graphs[device].relocated) {
             r.tensor->buffer = r.buffer;
             r.tensor->data   = r.data;
-            ggml_backend_tensor_set(r.tensor, r.host.data(), 0, r.host.size());
-            r.tensor->buffer = nullptr;
-            r.tensor->data   = r.host.data();
+            const void * host_data = ggml_backend_buffer_get_base(r.host);
+            ggml_backend_tensor_set(r.tensor, host_data, 0, ggml_nbytes(r.tensor));
+            r.tensor->buffer = r.host;
+            r.tensor->data   = (void *) host_data;
         }
     } else {
         status = ggml_backend_graph_compute(backends[device], graph);
@@ -2003,6 +2016,11 @@ rpc_server::~rpc_server() {
     }
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
+    }
+    for (auto & g : stored_graphs) {
+        for (auto & r : g.relocated) {
+            ggml_backend_buffer_free(r.host);
+        }
     }
 }
 
